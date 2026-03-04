@@ -17,7 +17,7 @@ Fonctions exportées :
 import re
 import unicodedata
 from collections import Counter
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 
 def texte_necessite_ocr(texte: str, pages_fitz: list = None) -> bool:
@@ -59,6 +59,37 @@ def _parse_montant(raw: str) -> Decimal | None:
         return m if m > 0 else None
     except (InvalidOperation, ValueError):
         return None
+
+
+def _trouver_triplet_ttc(vals: list[Decimal]) -> dict | None:
+    """Cherche un triplet HT + TVA = TTC dans une liste de montants.
+
+    Valide que le taux TVA implicite est un taux suisse connu (8.1%, 2.6%, 3.8%, 7.7%).
+    Retourne le triplet avec le TTC le plus élevé, ou None.
+    """
+    taux_suisses = [Decimal('8.1'), Decimal('2.6'), Decimal('3.8'), Decimal('7.7')]
+    best = None
+    for i in range(len(vals)):
+        for j in range(len(vals)):
+            if i == j:
+                continue
+            for k in range(len(vals)):
+                if k in (i, j):
+                    continue
+                ht, tva, ttc = vals[i], vals[j], vals[k]
+                if ttc <= ht or ttc <= tva or ht <= tva:
+                    continue
+                if abs(ht + tva - ttc) > Decimal('0.02'):
+                    continue
+                if ht > 0:
+                    taux = (tva / ht * 100).quantize(Decimal('0.1'), ROUND_HALF_UP)
+                    if not any(abs(taux - t) < Decimal('0.3') for t in taux_suisses):
+                        continue
+                else:
+                    continue
+                if best is None or ttc > best['ttc']:
+                    best = {'ht': ht, 'tva': tva, 'ttc': ttc}
+    return best
 
 
 def extraire_basique(texte: str) -> dict:
@@ -200,27 +231,55 @@ def extraire_basique(texte: str) -> dict:
             montant = _parse_montant(m.group(1))
             if montant:
                 resultat['montant_ttc'] = montant
+                # Chercher un triplet HT+TVA=TTC dans les montants adjacents
+                # (layout tabulaire: le premier montant capté peut être HT, pas TTC)
+                after_pos = m.start()
+                nearby = texte[after_pos:after_pos + 200]
+                nearby_vals = [_parse_montant(v) for v in re.findall(montant_pattern, nearby)]
+                nearby_vals = [v for v in nearby_vals if v is not None and v > 0]
+                triplet = _trouver_triplet_ttc(nearby_vals)
+                if triplet:
+                    resultat['montant_ttc'] = triplet['ttc']
+                    resultat['montant_ht'] = triplet['ht']
+                    resultat['montant_tva'] = triplet['tva']
                 break
 
     if not resultat.get('montant_ttc'):
         candidats_ttc = []
+        first_match_pos = None
         for kw in kw_ttc_generiques:
             for m in re.finditer(kw + montant_pattern, texte, re.IGNORECASE):
                 montant = _parse_montant(m.group(1))
                 if montant:
                     candidats_ttc.append(montant)
+                    if first_match_pos is None:
+                        first_match_pos = m.start()
         if not candidats_ttc:
             for m in re.finditer(r'CHF\s*' + montant_pattern, texte, re.IGNORECASE):
                 montant = _parse_montant(m.group(1))
                 if montant:
                     candidats_ttc.append(montant)
+                    if first_match_pos is None:
+                        first_match_pos = m.start()
         if not candidats_ttc:
             for m in re.finditer(montant_pattern + r'\s*(?:CHF|EUR|Fr\.?)\b', texte, re.IGNORECASE):
                 montant = _parse_montant(m.group(1))
                 if montant and montant >= Decimal('1'):
                     candidats_ttc.append(montant)
+                    if first_match_pos is None:
+                        first_match_pos = m.start()
         if candidats_ttc:
             resultat['montant_ttc'] = max(candidats_ttc)
+            # Scan triplet autour du premier match générique
+            if first_match_pos is not None:
+                nearby = texte[first_match_pos:first_match_pos + 200]
+                nearby_vals = [_parse_montant(v) for v in re.findall(montant_pattern, nearby)]
+                nearby_vals = [v for v in nearby_vals if v is not None and v > 0]
+                triplet = _trouver_triplet_ttc(nearby_vals)
+                if triplet:
+                    resultat['montant_ttc'] = triplet['ttc']
+                    resultat['montant_ht'] = triplet['ht']
+                    resultat['montant_tva'] = triplet['tva']
 
     # Cross-validation QR
     ttc = resultat.get('montant_ttc')
@@ -348,6 +407,28 @@ def extraire_basique(texte: str) -> dict:
                 tva_rates_found.add(rate)
     resultat['tva_rates_detected'] = sorted(tva_rates_found)
     resultat['multi_tva'] = len(tva_rates_found) > 1
+
+    # ── Cross-validation HT + TVA = TTC ──
+    # Si les 3 montants sont connus, vérifier la cohérence arithmétique.
+    # Corrige le cas fréquent où le HT a été capté comme TTC (layout tabulaire).
+    _ttc = resultat.get('montant_ttc')
+    _ht = resultat.get('montant_ht')
+    _tva = resultat.get('montant_tva')
+
+    if _ht and _tva and _ht > _tva:
+        ttc_calc = _ht + _tva
+        # Vérifier que le taux TVA est un taux suisse plausible
+        taux_calc = (_tva / _ht * 100).quantize(Decimal('0.1'), ROUND_HALF_UP)
+        taux_suisses = [Decimal('8.1'), Decimal('2.6'), Decimal('3.8'), Decimal('7.7'),
+                        Decimal('0.0')]
+        taux_ok = any(abs(taux_calc - t) < Decimal('0.3') for t in taux_suisses)
+
+        if taux_ok:
+            if _ttc and abs(_ttc - _ht) < Decimal('0.02') and abs(ttc_calc - _ttc) > Decimal('0.5'):
+                # Le TTC stocké est en fait le HT → corriger
+                resultat['montant_ttc'] = ttc_calc
+            elif not _ttc:
+                resultat['montant_ttc'] = ttc_calc
 
     return resultat
 
