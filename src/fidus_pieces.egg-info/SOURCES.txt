@@ -1,0 +1,11 @@
+pyproject.toml
+src/fidus_pieces/__init__.py
+src/fidus_pieces/doctr.py
+src/fidus_pieces/extraction.py
+src/fidus_pieces/ocr.py
+src/fidus_pieces/signal_fusion.py
+src/fidus_pieces.egg-info/PKG-INFO
+src/fidus_pieces.egg-info/SOURCES.txt
+src/fidus_pieces.egg-info/dependency_links.txt
+src/fidus_pieces.egg-info/requires.txt
+src/fidus_pieces.egg-info/top_level.txt
